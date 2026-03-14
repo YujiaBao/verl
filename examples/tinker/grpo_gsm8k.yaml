@@ -1,0 +1,56 @@
+# GRPO training on GSM8K using Tinker as the remote compute backend.
+#
+# Usage:
+#   python -m verl.trainer.main_ppo \
+#     --config-path=../../examples/tinker \
+#     --config-name=grpo_gsm8k \
+#     algorithm.adv_estimator=grpo \
+#     actor_rollout_ref.actor.strategy=tinker \
+#     actor_rollout_ref.actor.engine.model_name=meta-llama/Llama-3.1-8B \
+#     actor_rollout_ref.actor.engine.lora_rank=32
+#
+# Requirements:
+#   - TINKER_API_KEY environment variable set
+#   - tinker Python package installed (`pip install tinker`)
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  max_prompt_length: 512
+  max_response_length: 1024
+  train_batch_size: 64
+
+actor_rollout_ref:
+  hybrid_engine: True
+  actor:
+    # Select Tinker as the compute backend
+    strategy: tinker
+    engine:
+      # Tinker-specific config
+      model_name: "meta-llama/Llama-3.1-8B"
+      lora_rank: 32
+      learning_rate: 1e-4
+  rollout:
+    name: tinker
+    response_length: 1024
+    temperature: 0.7
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+
+critic:
+  enable: null
+
+trainer:
+  total_epochs: 5
+  n_gpus_per_node: 1
+  project_name: tinker_verl
+  experiment_name: grpo_gsm8k
+  logger: ["console"]
