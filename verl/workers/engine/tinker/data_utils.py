@@ -229,11 +229,17 @@ def sample_responses_to_dataproto(
         else:
             all_rollout_logprobs.append(torch.zeros(max_response_length, dtype=torch.float32))
 
+    # Compute position_ids from attention_mask
+    stacked_attn = torch.stack(all_attention_mask)
+    position_ids = stacked_attn.long().cumsum(dim=-1) - 1
+    position_ids = position_ids.clamp(min=0)
+
     batch = {
         "prompts": torch.stack(all_prompts),
         "responses": torch.stack(all_responses),
         "input_ids": torch.stack(all_input_ids),
-        "attention_mask": torch.stack(all_attention_mask),
+        "attention_mask": stacked_attn,
+        "position_ids": position_ids,
         "rollout_log_probs": torch.stack(all_rollout_logprobs),
     }
 

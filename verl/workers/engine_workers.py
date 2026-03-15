@@ -424,27 +424,46 @@ class _TinkerTrainingWorkerShim:
     def reset(self):
         pass
 
-    def infer_batch(self, data: TensorDict) -> TensorDict:
+    def infer_batch(self, data):
         """Forward-only pass to compute log_probs."""
+        # Handle both TensorDict and DataProto inputs
+        from verl import DataProto
+        td = data.batch if isinstance(data, DataProto) else data
         with torch.no_grad():
-            output = self.engine.forward_backward_batch(data, self.loss_fn, forward_only=True)
+            output = self.engine.forward_backward_batch(td, self.loss_fn, forward_only=True)
         model_output = output.get("model_output", {})
-        return tu.get_tensordict(tensor_dict=model_output, non_tensor_dict={"metrics": output.get("metrics", {})})
+        # Add dummy entropy (Tinker doesn't compute entropy)
+        # Rename log_probs → old_log_probs and add entropys (expected by trainer)
+        if "log_probs" in model_output:
+            model_output["old_log_probs"] = model_output.pop("log_probs")
+        if "old_log_probs" in model_output and "entropys" not in model_output:
+            model_output["entropys"] = torch.zeros_like(model_output["old_log_probs"])
+        result = tu.get_tensordict(tensor_dict=model_output, non_tensor_dict={})
+        # Wrap in DataProto so dispatch collect returns DataProto (expected by legacy trainer path)
+        from verl import DataProto
+        return DataProto.from_tensordict(result)
 
-    def train_batch(self, data: TensorDict) -> TensorDict:
+    def train_batch(self, data) -> TensorDict:
         """Forward + backward + optimizer step."""
+        from verl import DataProto
+        if isinstance(data, DataProto):
+            data = data.batch
         output = self.engine.train_batch(data, self.loss_fn)
         model_output = output.get("model_output", {})
         metrics = output.get("metrics", {})
         return tu.get_tensordict(tensor_dict=model_output, non_tensor_dict={"metrics": metrics})
 
-    def train_mini_batch(self, data: TensorDict) -> TensorDict:
+    def train_mini_batch(self, data) -> TensorDict:
         """
         Simplified mini-batch training for Tinker.
 
         Tinker handles batching server-side, so we pass the full batch in one call
         rather than splitting into mini-batches with a DataLoader.
         """
+        from verl import DataProto
+        is_dataproto = isinstance(data, DataProto)
+        if is_dataproto:
+            data = data.batch
         epochs = tu.pop(data, key="epochs", default=1)
         # Pop dataloader-related keys that Tinker doesn't need
         tu.pop(data, key="mini_batch_size", default=None)
@@ -462,9 +481,8 @@ class _TinkerTrainingWorkerShim:
                 if batch_metrics:
                     append_to_dict(all_metrics, batch_metrics)
 
-        if all_metrics:
-            return tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": all_metrics}).cpu()
-        return None
+        from verl import DataProto
+        return DataProto(meta_info={"metrics": all_metrics if all_metrics else {}})
 
     def get_dispatch_collect(self):
         return {"dispatch_dp_rank": {"dp": 0}, "collect_dp_rank": {"dp": True}}
@@ -748,10 +766,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             output.meta_info = {}
         output.meta_info["metrics"] = [timing] * bs
         output.meta_info["timing"] = {}
-        # Add multi_modal_inputs (expected by training driver)
+        # Add fields expected by training driver
         import numpy as np
         if "multi_modal_inputs" not in output.non_tensor_batch:
             output.non_tensor_batch["multi_modal_inputs"] = np.array([{}] * bs, dtype=object)
+        # TODO: Compute real rewards via verl's reward function API.
+        # For now, set dummy rm_scores so the training loop can proceed.
+        if "rm_scores" not in output.batch.keys():
+            import torch
+            resp_len = output.batch["responses"].shape[-1]
+            output.batch["rm_scores"] = torch.zeros(bs, resp_len)
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

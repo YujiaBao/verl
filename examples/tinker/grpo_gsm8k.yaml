@@ -65,3 +65,4 @@ trainer:
   project_name: tinker_verl
   experiment_name: grpo_gsm8k
   logger: ["console"]
+  # Note: Tinker uses the legacy worker path (auto) with ActorRolloutRefWorker
