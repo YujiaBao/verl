@@ -1,0 +1,68 @@
+# GRPO training on GSM8K using Tinker as the remote compute backend.
+#
+# Usage:
+#   python -m verl.trainer.main_ppo \
+#     --config-path=../../examples/tinker \
+#     --config-name=grpo_gsm8k \
+#     algorithm.adv_estimator=grpo \
+#     actor_rollout_ref.actor.strategy=tinker \
+#     actor_rollout_ref.actor.engine.model_name=meta-llama/Llama-3.1-8B \
+#     actor_rollout_ref.actor.engine.lora_rank=32
+#
+# Requirements:
+#   - TINKER_API_KEY environment variable set
+#   - tinker Python package installed (`pip install tinker`)
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  max_prompt_length: 512
+  max_response_length: 1024
+  train_batch_size: 64
+
+actor_rollout_ref:
+  hybrid_engine: True
+  model:
+    path: meta-llama/Llama-3.1-8B
+    use_remove_padding: false
+  actor:
+    # Select Tinker as the compute backend
+    strategy: tinker
+    ppo_micro_batch_size_per_gpu: 8
+    ppo_mini_batch_size: 8
+    use_dynamic_bsz: false
+    engine:
+      # Tinker-specific config
+      model_name: "meta-llama/Llama-3.1-8B"
+      lora_rank: 32
+      learning_rate: 1e-4
+  rollout:
+    name: tinker
+    mode: async
+    response_length: 1024
+    temperature: 0.7
+    log_prob_micro_batch_size_per_gpu: 8
+    log_prob_use_dynamic_bsz: false
+    agent:
+      agent_loop_manager_class: verl.workers.rollout.tinker_rollout.manager.TinkerAgentLoopManager
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+
+critic:
+  enable: null
+
+trainer:
+  total_epochs: 5
+  n_gpus_per_node: 1
+  project_name: tinker_verl
+  experiment_name: grpo_gsm8k
+  logger: ["console"]
+  # Note: Tinker uses the legacy worker path (auto) with ActorRolloutRefWorker

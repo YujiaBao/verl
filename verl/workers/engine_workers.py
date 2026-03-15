@@ -405,6 +405,95 @@ class TrainingWorker(Worker, DistProfilerExtension):
         return self.engine.load_checkpoint(local_path, hdfs_path, del_local_after_load)
 
 
+class _TinkerTrainingWorkerShim:
+    """
+    Lightweight wrapper around TinkerEngine that mimics TrainingWorker's interface.
+
+    Used by ActorRolloutRefWorker when the Tinker backend is selected.
+    Avoids the full TrainingWorker __init__ which requires distributed setup,
+    process group initialization, and EngineRegistry.
+    """
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.loss_fn = None
+
+    def set_loss_fn(self, loss_fn):
+        self.loss_fn = loss_fn
+
+    def reset(self):
+        pass
+
+    def infer_batch(self, data):
+        """Forward-only pass to compute log_probs."""
+        # Handle both TensorDict and DataProto inputs
+        from verl import DataProto
+        td = data.batch if isinstance(data, DataProto) else data
+        with torch.no_grad():
+            output = self.engine.forward_backward_batch(td, self.loss_fn, forward_only=True)
+        model_output = output.get("model_output", {})
+        # Add dummy entropy (Tinker doesn't compute entropy)
+        # Rename log_probs → old_log_probs and add entropys (expected by trainer)
+        if "log_probs" in model_output:
+            model_output["old_log_probs"] = model_output.pop("log_probs")
+        if "old_log_probs" in model_output and "entropys" not in model_output:
+            model_output["entropys"] = torch.zeros_like(model_output["old_log_probs"])
+        result = tu.get_tensordict(tensor_dict=model_output, non_tensor_dict={})
+        # Wrap in DataProto so dispatch collect returns DataProto (expected by legacy trainer path)
+        from verl import DataProto
+        return DataProto.from_tensordict(result)
+
+    def train_batch(self, data) -> TensorDict:
+        """Forward + backward + optimizer step."""
+        from verl import DataProto
+        if isinstance(data, DataProto):
+            data = data.batch
+        output = self.engine.train_batch(data, self.loss_fn)
+        model_output = output.get("model_output", {})
+        metrics = output.get("metrics", {})
+        return tu.get_tensordict(tensor_dict=model_output, non_tensor_dict={"metrics": metrics})
+
+    def train_mini_batch(self, data) -> TensorDict:
+        """
+        Simplified mini-batch training for Tinker.
+
+        Tinker handles batching server-side, so we pass the full batch in one call
+        rather than splitting into mini-batches with a DataLoader.
+        """
+        from verl import DataProto
+        is_dataproto = isinstance(data, DataProto)
+        if is_dataproto:
+            data = data.batch
+        epochs = tu.pop(data, key="epochs", default=1)
+        # Pop dataloader-related keys that Tinker doesn't need
+        tu.pop(data, key="mini_batch_size", default=None)
+        tu.pop(data, key="num_mini_batch", default=None)
+        tu.pop(data, key="seed", default=None)
+        tu.pop(data, key="dataloader_kwargs", default=None)
+        tu.pop(data, key="disable_auto_offload", default=None)
+        tu.pop(data, key="global_batch_size", default=None)
+
+        all_metrics = {}
+        for _ in range(epochs):
+            output = self.train_batch(data)
+            if output is not None:
+                batch_metrics = tu.get(output, "metrics")
+                if batch_metrics:
+                    append_to_dict(all_metrics, batch_metrics)
+
+        from verl import DataProto
+        return DataProto(meta_info={"metrics": all_metrics if all_metrics else {}})
+
+    def get_dispatch_collect(self):
+        return {"dispatch_dp_rank": {"dp": 0}, "collect_dp_rank": {"dp": True}}
+
+    def load_checkpoint(self, *args, **kwargs):
+        self.engine.load_checkpoint(*args, **kwargs)
+
+    def save_checkpoint(self, *args, **kwargs):
+        self.engine.save_checkpoint(*args, **kwargs)
+
+
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     """Hybrid worker that includes actor model, rollout and optional ref model.
     For standalone actor or rollout, use ActorWorker or BaseRollout respectively.
@@ -461,6 +550,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
+
+        # Tinker backend: simplified init — no local model, GPU, or distributed setup
+        if getattr(self.config.actor, "strategy", None) == "tinker":
+            self._init_tinker_model(model_config)
+            return
 
         # 1. build reference model
         if "ref" in self.role:
@@ -582,6 +676,64 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
         aggressive_empty_cache(force_sync=True)
 
+    def _init_tinker_model(self, model_config):
+        """
+        Initialize actor, rollout, and optional ref using the Tinker remote backend.
+
+        Skips all distributed setup (device mesh, NCCL, checkpoint engine) since
+        Tinker handles compute server-side.
+        """
+        from functools import partial
+
+        from verl.workers.engine.tinker.engine import TinkerEngine
+        from verl.workers.rollout.tinker_rollout.rollout import TinkerRollout
+        from verl.workers.utils.losses import ppo_loss
+
+        # 1. Build actor
+        if "actor" in self.role:
+            actor_config: ActorConfig = omega_conf_to_dataclass(self.config.actor)
+            actor_config.model_config = model_config
+
+            engine = TinkerEngine(
+                model_config=model_config,
+                engine_config=actor_config.engine,
+                optimizer_config=getattr(actor_config, "optim", None),
+                checkpoint_config=getattr(actor_config, "checkpoint", None),
+            )
+            engine.initialize()
+
+            # Create a lightweight TrainingWorker-like wrapper
+            # We set the engine directly rather than going through EngineRegistry
+            # since Tinker doesn't need the full TrainingWorker distributed setup.
+            self.actor = _TinkerTrainingWorkerShim(engine)
+            self.loss_fn = partial(ppo_loss, config=actor_config)
+            self.actor.set_loss_fn(self.loss_fn)
+            self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
+
+        # 2. Build rollout
+        if "rollout" in self.role:
+            rollout_config = omega_conf_to_dataclass(self.config.rollout)
+            self.rollout = TinkerRollout(
+                config=rollout_config,
+                model_config=model_config,
+                device_mesh=None,
+            )
+            # Share engine reference so rollout can access latest_sampling_client
+            if self.actor is not None:
+                self.rollout._engine_ref = self.actor.engine
+
+        # 3. Build reference model (separate Tinker client)
+        if "ref" in self.role:
+            ref_engine = TinkerEngine(
+                model_config=model_config,
+                engine_config=self.config.ref.get("engine", self.config.actor.engine),
+                optimizer_config=None,
+                checkpoint_config=None,
+            )
+            ref_engine.initialize()
+            self.ref = _TinkerTrainingWorkerShim(ref_engine)
+            self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     @_with_routing_replay_flag(enabled=False)
@@ -604,6 +756,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
+    @register(dispatch_mode=Dispatch.ALL_TO_ALL)
+    def generate_sequences(self, prompts):
+        """Generate sequences using the rollout backend (Tinker)."""
+        output = self.rollout.generate_sequences(prompts=prompts)
+        bs = output.batch.shape[0]
+        timing = {"generate_sequences": 0.0, "tool_calls": 0.0, "num_preempted": 0}
+        if not hasattr(output, "meta_info") or output.meta_info is None:
+            output.meta_info = {}
+        output.meta_info["metrics"] = [timing] * bs
+        output.meta_info["timing"] = {}
+        # Add fields expected by training driver
+        import numpy as np
+        if "multi_modal_inputs" not in output.non_tensor_batch:
+            output.non_tensor_batch["multi_modal_inputs"] = np.array([{}] * bs, dtype=object)
+        return output
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
         assert "actor" in self.role, "load_checkpoint only support actor role"
@@ -623,6 +791,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
            - after update_weights: rollout should be in wake_up mode.
         2. For async training with disaggregated trainer and rollout, send_weights only by checkpoint engine.
         """
+
+        # 0. Tinker handles weight sync server-side — just update the sampling client
+        if getattr(self.config.actor, "strategy", None) == "tinker":
+            self.actor.engine.get_per_tensor_param()
+            if self.rollout is not None:
+                await self.rollout.update_weights()
+            return
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if self.config.rollout.checkpoint_engine.backend != "naive":

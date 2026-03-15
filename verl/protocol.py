@@ -582,6 +582,10 @@ class DataProto:
             meta_info=meta_info,
         )
 
+    def cpu(self) -> "DataProto":
+        """Move the batch to CPU."""
+        return self.to("cpu")
+
     def to(self, device) -> "DataProto":
         """move the batch to device
 

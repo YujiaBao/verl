@@ -162,6 +162,12 @@ class TaskRunner:
             actor_rollout_cls = AsyncActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
 
+        elif config.actor_rollout_ref.actor.strategy == "tinker":
+            from verl.workers.engine_workers import ActorRolloutRefWorker
+
+            actor_rollout_cls = ActorRolloutRefWorker
+            ray_worker_group_cls = RayWorkerGroup
+
         elif (
             config.actor_rollout_ref.actor.strategy == "veomni"
             or config.actor_rollout_ref.actor.strategy == "torchtitan"
@@ -260,6 +266,9 @@ class TaskRunner:
         # we don't need to add a separate ref policy worker group.
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
         if use_legacy_worker_impl == "disable":
+            return
+        # Tinker also handles ref policy inside ActorRolloutRefWorker
+        if config.actor_rollout_ref.actor.strategy == "tinker":
             return
 
         if need_reference_policy(config):
