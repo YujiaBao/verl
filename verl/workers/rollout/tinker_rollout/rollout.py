@@ -27,7 +27,7 @@ import torch
 from verl import DataProto
 
 from ..base import BaseRollout
-from ...engine.tinker.data_utils import extract_prompt_ids, sample_responses_to_dataproto
+from ...engine.tinker.data_utils import sample_responses_to_dataproto
 
 if TYPE_CHECKING:
     import tinker
@@ -79,6 +79,31 @@ class TinkerRollout(BaseRollout):
         """No-op — Tinker has no local GPU memory to release."""
         pass
 
+    def _get_prompt_ids(self, prompts: DataProto) -> list[list[int]]:
+        """Extract prompt token IDs from DataProto.
+
+        Handles two cases:
+        - Tensor batch with 'input_ids': extract from tensor (E2E test path)
+        - Non-tensor batch with 'raw_prompt': tokenize via Tinker (training driver path)
+        """
+        if prompts.batch is not None and "input_ids" in prompts.batch.keys():
+            from ...engine.tinker.data_utils import extract_prompt_ids
+            return extract_prompt_ids(prompts)
+
+        # Training driver path: use raw_prompt from non_tensor_batch
+        tokenizer = self._engine_ref.training_client.get_tokenizer()
+        prompt_ids_list = []
+        for i in range(len(prompts.non_tensor_batch.get("uid", []))):
+            raw_prompt = prompts.non_tensor_batch["raw_prompt"][i]
+            if isinstance(raw_prompt, list):
+                # Chat format — apply chat template
+                text = tokenizer.apply_chat_template(raw_prompt, tokenize=False, add_generation_prompt=True)
+                ids = tokenizer.encode(text)
+            else:
+                ids = tokenizer.encode(raw_prompt)
+            prompt_ids_list.append(ids)
+        return prompt_ids_list
+
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """
         Generate completions for a batch of prompts using Tinker.
@@ -98,7 +123,7 @@ class TinkerRollout(BaseRollout):
                 "Call update_weights() or set _engine_ref before generating."
             )
 
-        prompt_ids_list = extract_prompt_ids(prompts)
+        prompt_ids_list = self._get_prompt_ids(prompts)
 
         temperature = prompts.meta_info.get("temperature", 1.0)
         response_length = getattr(self.config, "response_length", 1024)

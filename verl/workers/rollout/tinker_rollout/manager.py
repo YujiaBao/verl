@@ -51,12 +51,10 @@ class TinkerAgentLoopManager:
         We call generate_sequences on the worker group which dispatches to the
         ActorRolloutRefWorker, which in turn calls TinkerRollout.generate_sequences.
         """
-        import ray
-
-        # Bypass the dispatch mechanism and call the workers directly.
-        # With Tinker there is only 1 worker so we send all data to it.
-        refs = self.worker_group.execute_all_async("generate_sequences", [prompts])
-        output = ray.get(refs)[0]
+        # Call generate_sequences through the worker group.
+        # The method uses ALL_TO_ALL dispatch which returns a list (one per worker).
+        result = self.worker_group.generate_sequences(prompts)
+        output = result[0] if isinstance(result, list) else result
 
         if output is None:
             raise RuntimeError("generate_sequences returned None")
