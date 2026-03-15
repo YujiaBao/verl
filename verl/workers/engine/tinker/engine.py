@@ -120,7 +120,13 @@ class TinkerEngine(BaseEngine):
         base_url = getattr(self.engine_config, "base_url", "") or os.environ.get("TINKER_BASE_URL", "")
         self.service_client = tinker.ServiceClient(base_url=base_url) if base_url else tinker.ServiceClient()
 
-        model_name = self.model_config.model_name
+        model_name = (
+            getattr(self.engine_config, "model_name", None)
+            or getattr(self.model_config, "model_name", None)
+            or getattr(self.model_config, "path", None)
+        )
+        if not model_name:
+            raise ValueError("Tinker engine requires model_name in engine_config or path in model_config")
         lora_rank = getattr(self.engine_config, "lora_rank", 32)
 
         logger.info(f"Creating Tinker training client for {model_name} with lora_rank={lora_rank}")

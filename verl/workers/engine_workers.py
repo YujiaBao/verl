@@ -467,7 +467,7 @@ class _TinkerTrainingWorkerShim:
         return None
 
     def get_dispatch_collect(self):
-        return {"dp_rank": 0, "is_collect": True}
+        return {"dispatch_dp_rank": {"dp": 0}, "collect_dp_rank": {"dp": True}}
 
     def load_checkpoint(self, *args, **kwargs):
         self.engine.load_checkpoint(*args, **kwargs)

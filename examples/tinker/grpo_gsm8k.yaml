@@ -28,9 +28,15 @@ data:
 
 actor_rollout_ref:
   hybrid_engine: True
+  model:
+    path: meta-llama/Llama-3.1-8B
+    use_remove_padding: false
   actor:
     # Select Tinker as the compute backend
     strategy: tinker
+    ppo_micro_batch_size_per_gpu: 8
+    ppo_mini_batch_size: 8
+    use_dynamic_bsz: false
     engine:
       # Tinker-specific config
       model_name: "meta-llama/Llama-3.1-8B"
@@ -38,8 +44,11 @@ actor_rollout_ref:
       learning_rate: 1e-4
   rollout:
     name: tinker
+    mode: async
     response_length: 1024
     temperature: 0.7
+    log_prob_micro_batch_size_per_gpu: 8
+    log_prob_use_dynamic_bsz: false
 
 algorithm:
   adv_estimator: grpo
