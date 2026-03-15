@@ -172,8 +172,10 @@ def logprobs_to_padded_tensor(
     """
     padded = []
     for logprobs, resp_len in zip(logprobs_list, response_lengths):
-        # Take the last resp_len logprobs (response portion)
+        # Take the last resp_len logprobs (response portion).
+        # Replace None values (e.g., first-token logprob) with 0.0.
         resp_logprobs = logprobs[-resp_len:] if resp_len > 0 else []
+        resp_logprobs = [lp if lp is not None else 0.0 for lp in resp_logprobs]
         t = torch.tensor(resp_logprobs, dtype=torch.float32)
         pad_size = max_response_length - len(t)
         if pad_size > 0:
