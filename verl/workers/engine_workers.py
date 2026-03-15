@@ -770,12 +770,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         import numpy as np
         if "multi_modal_inputs" not in output.non_tensor_batch:
             output.non_tensor_batch["multi_modal_inputs"] = np.array([{}] * bs, dtype=object)
-        # TODO: Compute real rewards via verl's reward function API.
-        # For now, set dummy rm_scores so the training loop can proceed.
-        if "rm_scores" not in output.batch.keys():
-            import torch
-            resp_len = output.batch["responses"].shape[-1]
-            output.batch["rm_scores"] = torch.zeros(bs, resp_len)
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
