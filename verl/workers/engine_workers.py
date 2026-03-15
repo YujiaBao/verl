@@ -738,6 +738,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    def generate_sequences(self, prompts):
+        """Generate sequences using the rollout backend (Tinker)."""
+        output = self.rollout.generate_sequences(prompts=prompts)
+        timing = {"generate_sequences": 0.0, "tool_calls": 0.0, "num_preempted": 0}
+        if not hasattr(output, "meta_info") or output.meta_info is None:
+            output.meta_info = {}
+        output.meta_info["metrics"] = [timing] * output.batch.shape[0]
+        output.meta_info["timing"] = {}
+        return output
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
         assert "actor" in self.role, "load_checkpoint only support actor role"

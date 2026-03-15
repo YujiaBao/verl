@@ -49,6 +49,8 @@ actor_rollout_ref:
     temperature: 0.7
     log_prob_micro_batch_size_per_gpu: 8
     log_prob_use_dynamic_bsz: false
+    agent:
+      agent_loop_manager_class: verl.workers.rollout.tinker_rollout.manager.TinkerAgentLoopManager
 
 algorithm:
   adv_estimator: grpo

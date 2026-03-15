@@ -244,13 +244,23 @@ def extract_prompt_ids(prompts: DataProto) -> list[list[int]]:
     """
     Extract per-example prompt token IDs from a DataProto, stripping padding.
 
+    Handles both formats:
+      - E2E tests: batch keys "prompts" and "attention_mask"
+      - Training driver: batch keys "input_ids" and "attention_mask"
+
     Args:
-        prompts: DataProto with batch keys "prompts" and "attention_mask".
+        prompts: DataProto with prompt token IDs and attention mask.
 
     Returns:
         List of token ID lists (no padding).
     """
-    prompt_ids = prompts.batch["prompts"]
+    if "prompts" in prompts.batch.keys():
+        prompt_ids = prompts.batch["prompts"]
+    elif "input_ids" in prompts.batch.keys():
+        prompt_ids = prompts.batch["input_ids"]
+    else:
+        raise KeyError(f"Expected 'prompts' or 'input_ids' in batch, got: {list(prompts.batch.keys())}")
+
     attention_mask = prompts.batch["attention_mask"]
     prompt_len = prompt_ids.shape[1]
     bs = prompt_ids.shape[0]
