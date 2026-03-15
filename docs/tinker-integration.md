@@ -1,134 +1,139 @@
-# Tinker Backend Integration for verl
+# Tinker Backend for verl
 
-## Overview
+## What is Tinker?
 
-This document summarizes the integration of [Tinker](https://thinkingmachines.ai/tinker/) as a remote compute backend for verl. Tinker is an LLM post-training service that handles all GPU work (forward pass, backward pass, optimizer step, generation) server-side. This integration allows verl users to run RL training algorithms (GRPO, RLOO, REINFORCE++) without local GPUs.
+[Tinker](https://thinkingmachines.ai/tinker/) is an LLM post-training API that handles all GPU compute — forward pass, backward pass, optimizer step, and text generation — server-side. This integration lets verl users run RL training algorithms (GRPO, RLOO, REINFORCE++) through Tinker's API, without managing local model weights or GPU infrastructure.
 
-## Background & Design Decisions
+## How it works
 
-### Why verl?
-
-We evaluated three integration targets:
-
-1. **TRL (Hugging Face)** — `transformers.Trainer` inheritance chain is deeply coupled to local PyTorch. Every trainer mixes orchestration logic with local tensor operations. Replacing the compute backend would require reimplementing essentially the entire trainer — no code reuse of algorithm-level features (loss variants, advantage estimation, reward composition). Rejected.
-
-2. **Standalone `trl-tinker` package** — Would require constant rebasing against TRL's fast-moving main branch. Maintenance burden outweighs distribution benefit. Rejected.
-
-3. **verl** — Already has a `BaseEngine` abstraction and `EngineRegistry` for pluggable compute backends (FSDP, Megatron, TorchTitan). The training driver (`RayPPOTrainer.fit()`) orchestrates workers via RPC without touching GPU compute directly. Advantage estimators, reward computation, and logging all run on the CPU driver and are backend-agnostic. **Chosen.**
-
-### Architecture
+verl's training driver (`RayPPOTrainer`) orchestrates the RL loop: generate responses, compute rewards, estimate advantages, update the policy. Normally, each step runs on local GPUs via FSDP or Megatron. With the Tinker backend, these steps are routed to Tinker's remote API instead:
 
 ```
-RayPPOTrainer.fit()                   ← UNCHANGED
+RayPPOTrainer.fit()
          │
-         ├── ActorRolloutRefWorker    ← Tinker init branch added
-         │     ├── actor: _TinkerTrainingWorkerShim
-         │     │     └── TinkerEngine(BaseEngine)
-         │     │           └── tinker.TrainingClient
-         │     ├── rollout: TinkerRollout(BaseRollout)
-         │     │     └── tinker.SamplingClient
-         │     └── ref: _TinkerTrainingWorkerShim (optional)
-         │           └── TinkerEngine (separate TrainingClient)
+         ├── generate_sequences()
+         │     └── TinkerRollout → tinker.SamplingClient.sample()
          │
-         └── No critic worker (Phase 1)
+         ├── compute_log_prob()
+         │     └── TinkerEngine → tinker.SamplingClient.compute_logprobs()
+         │
+         ├── compute_advantages()        ← runs locally (CPU, no change)
+         │
+         ├── update_actor()
+         │     └── TinkerEngine → tinker.TrainingClient.forward_backward()
+         │                      → tinker.TrainingClient.optim_step()
+         │
+         └── update_weights()
+               └── TinkerEngine → tinker.TrainingClient.save_weights_and_get_sampling_client()
 ```
 
-**Key design decisions:**
+Advantage estimation, reward computation, and logging all run on the CPU driver and are backend-agnostic — they work exactly the same as with FSDP or Megatron.
 
-- **`_TinkerTrainingWorkerShim`** instead of full `TrainingWorker`: The standard `TrainingWorker.__init__` calls `initialize_global_process_group_ray()` and creates a device mesh, which requires GPUs. The shim provides the same interface (`infer_batch`, `train_batch`, `train_mini_batch`) but delegates directly to `TinkerEngine` without distributed setup.
+## Quick start
 
-- **Weight sync via shared reference**: Tinker weights never leave the server. `TinkerEngine.get_per_tensor_param()` creates a server-side snapshot and returns an empty weight generator. `TinkerRollout` picks up the new `SamplingClient` from `engine.latest_sampling_client` via a shared reference.
+### Prerequisites
 
-- **Loss function mapping**: verl passes `partial(ppo_loss, config=actor_config)` as a callable. `TinkerEngine` inspects the partial's config to determine the Tinker loss name (`"ppo"`, `"cispo"`, `"importance_sampling"`). Unsupported loss modes raise `NotImplementedError` with a clear message.
+```bash
+pip install tinker
+export TINKER_API_KEY=your_key_here
+```
 
-- **Concurrent generation**: `TinkerRollout.generate_sequences()` submits all `sample()` calls as futures, then collects results. Same pattern used by the tinker-cookbook for RL rollouts.
+### Run GRPO training
 
-## What's Been Implemented
+```bash
+python -m verl.trainer.main_ppo \
+  --config-path=examples/tinker \
+  --config-name=grpo_gsm8k \
+  actor_rollout_ref.model.path=Qwen/Qwen3-8B \
+  actor_rollout_ref.actor.engine.model_name=Qwen/Qwen3-8B \
+  data.train_files=path/to/train.parquet \
+  data.val_files=path/to/test.parquet
+```
 
-### New Files
+### Run E2E tests (standalone, no Ray)
 
-| File | Purpose |
-|---|---|
-| `verl/workers/engine/tinker/__init__.py` | Package init |
-| `verl/workers/engine/tinker/engine.py` | `TinkerEngine(BaseEngine)` — routes forward/backward/optim to Tinker API |
-| `verl/workers/engine/tinker/data_utils.py` | TensorDict ↔ Tinker Datum/ModelInput translation |
-| `verl/workers/rollout/tinker_rollout/__init__.py` | Package init |
-| `verl/workers/rollout/tinker_rollout/rollout.py` | `TinkerRollout(BaseRollout)` — generation via SamplingClient |
-| `verl/workers/config/tinker.py` | `TinkerEngineConfig` dataclass |
-| `examples/tinker/grpo_gsm8k.yaml` | Example GRPO config with Tinker backend |
-| `tests/unit/tinker_backend/test_data_utils.py` | Data translation unit tests (12/12 passing) |
-| `tests/unit/tinker_backend/test_engine.py` | Loss mapping unit tests (12/12 passing) |
-| `tests/e2e/tinker/test_grpo.py` | E2E GRPO training loop |
-| `tests/e2e/tinker/test_rloo.py` | E2E RLOO training loop |
-| `tests/e2e/tinker/test_reinforce_pp.py` | E2E REINFORCE++ training loop |
-| `tests/e2e/tinker/README.md` | E2E test documentation |
+```bash
+# GRPO
+python tests/e2e/tinker/test_grpo.py --model Qwen/Qwen3-8B --steps 3
 
-### Modified Files
+# RLOO
+python tests/e2e/tinker/test_rloo.py --model Qwen/Qwen3-8B --steps 3
+
+# REINFORCE++
+python tests/e2e/tinker/test_reinforce_pp.py --model Qwen/Qwen3-8B --steps 3
+```
+
+### Run unit tests (no API key needed)
+
+```bash
+python -m pytest tests/unit/tinker_backend/ -v
+```
+
+## Architecture
+
+### New components
+
+| Component | File | Role |
+|---|---|---|
+| `TinkerEngine` | `verl/workers/engine/tinker/engine.py` | `BaseEngine` subclass — routes forward/backward/optimizer to Tinker API |
+| `TinkerRollout` | `verl/workers/rollout/tinker_rollout/rollout.py` | `BaseRollout` subclass — generates text via Tinker's SamplingClient |
+| `TinkerAgentLoopManager` | `verl/workers/rollout/tinker_rollout/manager.py` | Replaces the default AgentLoopManager (which manages local vLLM/SGLang servers) with a lightweight manager that calls TinkerRollout and computes rewards |
+| `_TinkerTrainingWorkerShim` | `verl/workers/engine_workers.py` | Lightweight wrapper mimicking `TrainingWorker` interface without distributed setup |
+| Data translation | `verl/workers/engine/tinker/data_utils.py` | Converts between verl's TensorDict and Tinker's Datum/ModelInput formats |
+
+### Changes to existing files
 
 | File | Change |
 |---|---|
-| `verl/workers/rollout/base.py` | Added `("tinker", "async")` to `_ROLLOUT_REGISTRY` (+1 line) |
-| `verl/workers/engine_workers.py` | Added `_TinkerTrainingWorkerShim` class and `_init_tinker_model()` in `ActorRolloutRefWorker` |
+| `verl/workers/rollout/base.py` | +1 line: register `("tinker", "async")` in rollout registry |
+| `verl/workers/engine_workers.py` | Add shim class, `_init_tinker_model()`, and `generate_sequences()` |
+| `verl/trainer/main_ppo.py` | +9 lines: register `tinker` strategy, skip separate ref policy worker |
+| `verl/protocol.py` | +4 lines: add `DataProto.cpu()` convenience method |
 
-### Test Results
+All Tinker imports are soft (inside methods, not at module level). verl works normally without tinker installed.
 
-- **12/12 unit tests passing** (data translation + loss mapping)
-- **3 E2E test scripts** ready for validation with a live Tinker service
+## Design decisions
 
-## What Remains (TODO)
+### Data format alignment
 
-### Must-Have for Initial PR
+Tinker expects a right-shifted sequence format (matching the [tinker-cookbook](https://github.com/thinking-machines-lab/tinker-cookbook) conventions):
 
-- [ ] **Run E2E tests against live Tinker service** — The E2E tests (`test_grpo.py`, `test_rloo.py`, `test_reinforce_pp.py`) need validation with a real `TINKER_API_KEY`. May surface data format issues in the translation layer.
-
-- [ ] **Validate `forward_backward` return format** — Verify that `result.loss_fn_outputs[i]["logprobs"]` logprob lengths match verl's expected `(bs, response_len)` shape after the `logprobs_to_padded_tensor` conversion. The logprobs from Tinker cover the full sequence; we extract the response portion — need to confirm alignment.
-
-- [ ] **Test with verl's full training driver (`main_ppo.py`)** — The E2E tests bypass Ray and call TinkerEngine directly. Need to also verify the integration works through `RayPPOTrainer.fit()` → `ActorRolloutRefWorker._init_tinker_model()` → full pipeline. This requires a single-GPU node to satisfy Ray's setup.
-
-- [ ] **LR scheduling bridge** — `TinkerEngine` stores `self._lr` and passes it to `optim_step()`. Need to verify that verl's `TrainingWorker` calls `lr_scheduler_step()` at the right time and that we correctly read the scheduled LR. May need to hook into verl's LR scheduler output.
-
-### Nice-to-Have (Phase 2)
-
-- [ ] **`forward_backward_custom` support** — For exotic loss modes (`dppo_tv`, `gspo`, `sapo`, `vespo`), use Tinker's `forward_backward_custom` which gives us logprobs to compute arbitrary losses client-side. Currently these raise `NotImplementedError`.
-
-- [ ] **Nested tensor support** — Phase 1 uses padded format (`use_remove_padding=False`). Adding nested tensor (jagged layout) support would improve memory efficiency for variable-length sequences.
-
-- [ ] **CPU-only mode** — Currently requires a single GPU node to satisfy Ray/verl's distributed setup. A Tinker-specific init path that fully bypasses `init_device_mesh()` and NCCL would enable pure CPU operation.
-
-- [ ] **Critic support (PPO with GAE)** — Phase 1 covers critic-free algorithms. PPO with GAE needs a value model, which would be a second `TrainingClient`. The architecture supports this (separate `TinkerEngine` for critic), but the data flow (value predictions, GAE computation) needs implementation.
-
-- [ ] **`TrainingWorker._postprocess_output` compatibility** — The shim bypasses `_postprocess_output` which handles `all_reduce` on metrics. For single-process Tinker runs this is fine, but if Tinker is used alongside local workers (e.g., local critic + Tinker actor), metric aggregation may need attention.
-
-- [ ] **Checkpoint resume** — `TinkerEngine.load_checkpoint()` is currently a no-op. Need to implement resume via `ServiceClient.create_training_client_from_state_async()`.
-
-- [ ] **Upstream PR to verl-project/verl** — The integration uses soft imports (`import tinker` inside methods) and all new code is in `tinker/` subdirectories. No existing tests or functionality are affected. The PR pitch: "Tinker lets users run verl's RL algorithms without local GPUs — same algorithms, zero infrastructure."
-
-## How to Run
-
-### Unit tests (no Tinker API needed)
-
-```bash
-cd ~/Repos/verl
-.venv/bin/python -m pytest tests/unit/tinker_backend/ -v
+```
+Original tokens:    [A, B, C, D, E, F]    (prompt=[A,B,C], response=[D,E,F])
+model_input:        [A, B, C, D, E]        (tokens[:-1], what the model sees)
+target_tokens:      [B, C, D, E, F]        (tokens[1:], what the model predicts)
+logprobs:           [0, 0, lp_D, lp_E, lp_F]   (0 for observation, real for action)
+advantages:         [0, 0, adv_D, adv_E, adv_F] (0 for observation, real for action)
 ```
 
-### E2E tests (requires TINKER_API_KEY)
+The observation (prompt) positions have zero advantages, so the loss gradient is zero for prompt tokens regardless of the target values.
 
-```bash
-export TINKER_API_KEY=your_key_here
+### Weight synchronization
 
-# GRPO
-.venv/bin/python tests/e2e/tinker/test_grpo.py --model meta-llama/Llama-3.1-8B --steps 3
+Tinker weights never leave the server. Instead of transferring model parameters:
 
-# RLOO (4 samples per prompt)
-.venv/bin/python tests/e2e/tinker/test_rloo.py --model meta-llama/Llama-3.1-8B --steps 3
+1. `TinkerEngine.get_per_tensor_param()` calls `save_weights_and_get_sampling_client()` on the Tinker server, creating a server-side snapshot
+2. The new `SamplingClient` is shared with `TinkerRollout` via a reference
+3. `TinkerRollout.update_weights()` picks up the latest `SamplingClient`
 
-# REINFORCE++
-.venv/bin/python tests/e2e/tinker/test_reinforce_pp.py --model meta-llama/Llama-3.1-8B --steps 3
-```
+### Loss function mapping
 
-## Repository
+verl's `ppo_loss` config is mapped to Tinker loss functions:
 
-- **Fork:** https://github.com/YujiaBao/verl
-- **Branch:** `feature/tinker-backend`
-- **Upstream:** https://github.com/verl-project/verl
+| verl loss_mode | Tinker loss_fn | Notes |
+|---|---|---|
+| `vanilla` | `ppo` | Clip thresholds via `loss_fn_config` |
+| `cispo` | `cispo` | |
+| `bypass_mode` | `importance_sampling` | REINFORCE-style, no clipping |
+
+## Supported algorithms
+
+- **GRPO** — Group Relative Policy Optimization (tested E2E)
+- **RLOO** — Leave-One-Out baseline (tested E2E)
+- **REINFORCE++** — Token-level discounted returns (tested E2E)
+
+## Current limitations
+
+- **Critic-free only** — PPO with GAE (value model) is not yet supported. A second `TrainingClient` for the critic model is architecturally possible but not implemented.
+- **No checkpoint resume** — `TinkerEngine.load_checkpoint()` is a no-op. Resume via `ServiceClient.create_training_client_from_state()` is planned.
+- **No mask field** — The `mask` key in `loss_fn_inputs` (0 for observation, 1 for action) is used in the tinker-cookbook but not yet accepted by the server (v0.15). Correctness is maintained because observation positions have zero advantages.
