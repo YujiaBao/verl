@@ -75,30 +75,51 @@ def tensordict_to_datums(
             seq_len = len(tokens)  # non-padded sequence length
 
             if resp_len > 0:
-                # Tinker expects all loss_fn_inputs to be full-sequence-length,
-                # matching the number of tokens in model_input.
+                # Following the tinker-cookbook pattern:
+                # - model_input = tokens[:-1]  (right-shifted: what the model sees)
+                # - target_tokens = tokens[1:]  (left-shifted: what the model predicts)
+                # - All loss_fn_inputs have length = model_input.length = seq_len - 1
 
-                # Target tokens: full sequence (Tinker applies shifting internally)
+                input_tokens = tokens[:-1]
+                target_tokens = tokens[1:]
+                model_input = tinker.ModelInput.from_ints(input_tokens)
+                input_len = len(input_tokens)
+
                 loss_fn_inputs["target_tokens"] = tinker.TensorData.from_numpy(
-                    np.array(tokens, dtype=np.int64)
+                    np.array(target_tokens, dtype=np.int64)
                 )
 
-                # Prompt length in the non-padded sequence
+                # ob_len: observation (prompt) portion in the shifted sequence.
+                # prompt_len tokens in original → prompt_len - 1 observation positions
+                # in the shifted view (the first prompt token has no prior context).
                 prompt_len = seq_len - resp_len
+                ob_len = prompt_len - 1
 
-                # Old policy log probs — zero for prompt, real values for response
+                # Old policy log probs: 0 for observation, real values for action
                 if "old_log_probs" in data.keys():
-                    full_lp = torch.zeros(seq_len, dtype=torch.float32)
-                    old_lp = data["old_log_probs"][i][:resp_len]
-                    full_lp[prompt_len : prompt_len + resp_len] = old_lp
-                    loss_fn_inputs["logprobs"] = tinker.TensorData.from_torch(full_lp)
+                    padded_lp = [0.0] * ob_len
+                    old_lp = data["old_log_probs"][i][:resp_len].tolist()
+                    padded_lp.extend(old_lp)
+                    # Pad to input_len if needed (response may be shorter)
+                    padded_lp.extend([0.0] * (input_len - len(padded_lp)))
+                    loss_fn_inputs["logprobs"] = tinker.TensorData.from_torch(
+                        torch.tensor(padded_lp[:input_len], dtype=torch.float32)
+                    )
 
-                # Per-token advantages — zero for prompt, real values for response
+                # Per-token advantages: 0 for observation, real values for action
                 if "advantages" in data.keys():
-                    full_adv = torch.zeros(seq_len, dtype=torch.float32)
-                    adv = data["advantages"][i][:resp_len]
-                    full_adv[prompt_len : prompt_len + resp_len] = adv
-                    loss_fn_inputs["advantages"] = tinker.TensorData.from_torch(full_adv)
+                    padded_adv = [0.0] * ob_len
+                    adv = data["advantages"][i][:resp_len].tolist()
+                    padded_adv.extend(adv)
+                    padded_adv.extend([0.0] * (input_len - len(padded_adv)))
+                    loss_fn_inputs["advantages"] = tinker.TensorData.from_torch(
+                        torch.tensor(padded_adv[:input_len], dtype=torch.float32)
+                    )
+
+                # Note: The "mask" key (0 for observation, 1 for action) is used
+                # in the tinker-cookbook but not yet supported by the server (v0.15).
+                # Without mask, prompt tokens still have advantages=0, so the
+                # importance_sampling loss gradient for prompt positions is zero.
 
         datums.append(tinker.Datum(model_input=model_input, loss_fn_inputs=loss_fn_inputs))
 

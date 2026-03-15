@@ -131,12 +131,13 @@ class TestTensordictToDatums:
             assert "logprobs" in datum.loss_fn_inputs
             assert "advantages" in datum.loss_fn_inputs
 
-            # All loss_fn_inputs should be full sequence length (non-padded)
-            # seq_len=18 minus 2 padding tokens = 16 non-padded tokens
-            expected_len = 10 + 8 - 2
+            # After right-shift: model_input = tokens[:-1], target = tokens[1:]
+            # seq_len=18 minus 2 padding = 16 non-padded, then -1 for shift = 15
+            expected_len = 10 + 8 - 2 - 1
             assert len(datum.loss_fn_inputs["target_tokens"].data) == expected_len
             assert len(datum.loss_fn_inputs["logprobs"].data) == expected_len
             assert len(datum.loss_fn_inputs["advantages"].data) == expected_len
+            assert datum.model_input.length == expected_len
 
     def test_padding_stripped(self):
         """Verify that padding tokens are stripped from model_input."""
