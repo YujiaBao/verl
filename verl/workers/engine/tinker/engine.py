@@ -48,10 +48,10 @@ VERL_LOSS_MODE_TO_TINKER = {
 def _resolve_tinker_loss(loss_function: Callable) -> tuple[str, dict[str, float]]:
     """
     Map a verl loss function (typically partial(ppo_loss, config=...)) to a
-    Tinker loss function name and config dict.
+    Tinker loss function name and loss_fn_config dict.
 
     Returns:
-        (tinker_loss_name, tinker_loss_config)
+        (tinker_loss_name, loss_fn_config)
     """
     # Extract the ActorConfig from the partial's keywords
     config = None
@@ -73,12 +73,13 @@ def _resolve_tinker_loss(loss_function: Callable) -> tuple[str, dict[str, float]
         )
 
     tinker_name = VERL_LOSS_MODE_TO_TINKER[loss_mode]
-    tinker_config: dict[str, float] = {}
+    loss_fn_config: dict[str, float] = {}
 
     if tinker_name == "ppo" and hasattr(config, "cliprange"):
-        tinker_config["clip_param"] = config.cliprange
+        loss_fn_config["clip_low_threshold"] = 1.0 - config.cliprange
+        loss_fn_config["clip_high_threshold"] = 1.0 + config.cliprange
 
-    return tinker_name, tinker_config
+    return tinker_name, loss_fn_config
 
 
 @EngineRegistry.register(model_type="language_model", backend="tinker")
@@ -222,13 +223,13 @@ class TinkerEngine(BaseEngine):
         datums = tensordict_to_datums(data, for_training=True)
 
         # Resolve loss function
-        tinker_loss_name, tinker_loss_config = _resolve_tinker_loss(loss_function)
+        tinker_loss_name, loss_fn_config = _resolve_tinker_loss(loss_function)
 
         # Call Tinker forward_backward
         result: tinker.ForwardBackwardOutput = self.training_client.forward_backward(
             data=datums,
             loss_fn=tinker_loss_name,
-            loss_fn_config=tinker_loss_config if tinker_loss_config else None,
+            loss_fn_config=loss_fn_config if loss_fn_config else None,
         ).result()
 
         # Extract new-policy logprobs from result

@@ -30,9 +30,10 @@ class TestResolveTinkerLoss:
         )
         loss_fn = partial(lambda config, model_output, data: None, config=config)
 
-        name, cfg = _resolve_tinker_loss(loss_fn)
+        name, extra = _resolve_tinker_loss(loss_fn)
         assert name == "ppo"
-        assert cfg["clip_param"] == 0.2
+        assert extra["clip_low_threshold"] == pytest.approx(0.8)
+        assert extra["clip_high_threshold"] == pytest.approx(1.2)
 
     def test_cispo(self):
         """cispo loss mode maps directly."""

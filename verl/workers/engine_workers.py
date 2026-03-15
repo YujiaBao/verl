@@ -690,6 +690,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor = _TinkerTrainingWorkerShim(engine)
             self.loss_fn = partial(ppo_loss, config=actor_config)
             self.actor.set_loss_fn(self.loss_fn)
+            self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
         # 2. Build rollout
         if "rollout" in self.role:
@@ -713,6 +714,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
             ref_engine.initialize()
             self.ref = _TinkerTrainingWorkerShim(ref_engine)
+            self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
@@ -755,6 +757,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
            - after update_weights: rollout should be in wake_up mode.
         2. For async training with disaggregated trainer and rollout, send_weights only by checkpoint engine.
         """
+
+        # 0. Tinker handles weight sync server-side — just update the sampling client
+        if getattr(self.config.actor, "strategy", None) == "tinker":
+            self.actor.engine.get_per_tensor_param()
+            if self.rollout is not None:
+                await self.rollout.update_weights()
+            return
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if self.config.rollout.checkpoint_engine.backend != "naive":

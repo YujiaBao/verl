@@ -72,31 +72,33 @@ def tensordict_to_datums(
             response_mask = data["response_mask"]
             resp_mask_i = response_mask[i]
             resp_len = int(resp_mask_i.sum().item())
+            seq_len = len(tokens)  # non-padded sequence length
 
             if resp_len > 0:
-                # Target tokens: the response portion of the sequence.
-                # Tinker expects target_tokens aligned with the model_input —
-                # specifically the tokens the model should predict (shifted by one
-                # internally by the loss function on the server).
-                response_tokens = tokens[-resp_len:]
+                # Tinker expects all loss_fn_inputs to be full-sequence-length,
+                # matching the number of tokens in model_input.
+
+                # Target tokens: full sequence (Tinker applies shifting internally)
                 loss_fn_inputs["target_tokens"] = tinker.TensorData.from_numpy(
-                    np.array(response_tokens, dtype=np.int64)
+                    np.array(tokens, dtype=np.int64)
                 )
 
-                # Old policy log probs (sampling logprobs for importance sampling)
+                # Prompt length in the non-padded sequence
+                prompt_len = seq_len - resp_len
+
+                # Old policy log probs — zero for prompt, real values for response
                 if "old_log_probs" in data.keys():
+                    full_lp = torch.zeros(seq_len, dtype=torch.float32)
                     old_lp = data["old_log_probs"][i][:resp_len]
-                    loss_fn_inputs["logprobs"] = tinker.TensorData.from_torch(old_lp.float())
+                    full_lp[prompt_len : prompt_len + resp_len] = old_lp
+                    loss_fn_inputs["logprobs"] = tinker.TensorData.from_torch(full_lp)
 
-                # Per-token advantages
+                # Per-token advantages — zero for prompt, real values for response
                 if "advantages" in data.keys():
+                    full_adv = torch.zeros(seq_len, dtype=torch.float32)
                     adv = data["advantages"][i][:resp_len]
-                    loss_fn_inputs["advantages"] = tinker.TensorData.from_torch(adv.float())
-
-                # Response mask (which tokens contribute to loss)
-                loss_fn_inputs["mask"] = tinker.TensorData.from_torch(
-                    resp_mask_i[:resp_len].float()
-                )
+                    full_adv[prompt_len : prompt_len + resp_len] = adv
+                    loss_fn_inputs["advantages"] = tinker.TensorData.from_torch(full_adv)
 
         datums.append(tinker.Datum(model_input=model_input, loss_fn_inputs=loss_fn_inputs))
 
@@ -220,8 +222,8 @@ def sample_responses_to_dataproto(
         all_attention_mask.append(torch.tensor(attn_mask, dtype=torch.float32))
 
         # Rollout logprobs (if available)
-        if seq.token_log_probs is not None:
-            lp = list(seq.token_log_probs)[:max_response_length]
+        if seq.logprobs is not None:
+            lp = list(seq.logprobs)[:max_response_length]
             lp_padded = lp + [0.0] * (max_response_length - len(lp))
             all_rollout_logprobs.append(torch.tensor(lp_padded, dtype=torch.float32))
         else:

@@ -17,13 +17,9 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-tinker = pytest.importorskip("tinker", reason="tinker package not installed")
-
 from verl.workers.engine.tinker.data_utils import (
     extract_prompt_ids,
     logprobs_to_padded_tensor,
-    tensordict_to_datums,
-    tensordict_to_model_inputs,
 )
 
 
@@ -62,64 +58,7 @@ def _make_tensordict(
     return TensorDict(data, batch_size=[bs])
 
 
-class TestTensordictToDatums:
-    def test_inference_mode(self):
-        """In inference mode, datums should have empty loss_fn_inputs."""
-        data = _make_tensordict(bs=3, prompt_len=10, response_len=8)
-        datums = tensordict_to_datums(data, for_training=False)
-
-        assert len(datums) == 3
-        for datum in datums:
-            assert isinstance(datum, tinker.Datum)
-            assert datum.loss_fn_inputs == {}
-            # Model input should have tokens (non-padded)
-            tokens = datum.model_input.chunks[0].tokens
-            assert len(tokens) == 10 + 8 - 2  # seq_len minus 2 padding tokens
-
-    def test_training_mode(self):
-        """In training mode, datums should have loss_fn_inputs populated."""
-        data = _make_tensordict(bs=2, prompt_len=10, response_len=8, include_training_data=True)
-        datums = tensordict_to_datums(data, for_training=True)
-
-        assert len(datums) == 2
-        for datum in datums:
-            assert "target_tokens" in datum.loss_fn_inputs
-            assert "logprobs" in datum.loss_fn_inputs
-            assert "advantages" in datum.loss_fn_inputs
-            assert "mask" in datum.loss_fn_inputs
-
-            # Check lengths match response length (minus 1 padding token in response_mask)
-            real_resp = 7  # response_len(8) - 1 padding
-            assert len(datum.loss_fn_inputs["target_tokens"].data) == real_resp
-            assert len(datum.loss_fn_inputs["logprobs"].data) == real_resp
-            assert len(datum.loss_fn_inputs["advantages"].data) == real_resp
-
-    def test_padding_stripped(self):
-        """Verify that padding tokens are stripped from model_input."""
-        bs, prompt_len, response_len = 1, 5, 3
-        seq_len = prompt_len + response_len
-
-        input_ids = torch.tensor([[0, 0, 10, 20, 30, 40, 50, 60]])  # 2 pad + 6 real
-        attention_mask = torch.tensor([[0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]])
-        response_mask = torch.tensor([[1.0, 1.0, 0.0]])
-
-        data = TensorDict(
-            {"input_ids": input_ids, "attention_mask": attention_mask, "response_mask": response_mask},
-            batch_size=[1],
-        )
-
-        datums = tensordict_to_datums(data, for_training=False)
-        tokens = datums[0].model_input.chunks[0].tokens
-        assert tokens == [10, 20, 30, 40, 50, 60]  # padding stripped
-
-
-class TestTensordictToModelInputs:
-    def test_basic(self):
-        data = _make_tensordict(bs=2, prompt_len=5, response_len=3)
-        model_inputs = tensordict_to_model_inputs(data)
-        assert len(model_inputs) == 2
-        for mi in model_inputs:
-            assert isinstance(mi, tinker.ModelInput)
+# -- Tests that do NOT require the tinker package --
 
 
 class TestLogprobsToPaddedTensor:
@@ -155,3 +94,70 @@ class TestExtractPromptIds:
 
         ids = extract_prompt_ids(FakeDataProto())
         assert ids == [[10, 20, 30], [40, 50, 60, 70]]
+
+
+# -- Tests that require the tinker package --
+
+tinker = pytest.importorskip("tinker", reason="tinker package not installed")
+
+from verl.workers.engine.tinker.data_utils import (  # noqa: E402
+    tensordict_to_datums,
+    tensordict_to_model_inputs,
+)
+
+
+class TestTensordictToDatums:
+    def test_inference_mode(self):
+        """In inference mode, datums should have empty loss_fn_inputs."""
+        data = _make_tensordict(bs=3, prompt_len=10, response_len=8)
+        datums = tensordict_to_datums(data, for_training=False)
+
+        assert len(datums) == 3
+        for datum in datums:
+            assert isinstance(datum, tinker.Datum)
+            assert datum.loss_fn_inputs == {}
+            # Model input should have tokens (non-padded)
+            tokens = datum.model_input.chunks[0].tokens
+            assert len(tokens) == 10 + 8 - 2  # seq_len minus 2 padding tokens
+
+    def test_training_mode(self):
+        """In training mode, datums should have loss_fn_inputs populated."""
+        data = _make_tensordict(bs=2, prompt_len=10, response_len=8, include_training_data=True)
+        datums = tensordict_to_datums(data, for_training=True)
+
+        assert len(datums) == 2
+        for datum in datums:
+            assert "target_tokens" in datum.loss_fn_inputs
+            assert "logprobs" in datum.loss_fn_inputs
+            assert "advantages" in datum.loss_fn_inputs
+
+            # All loss_fn_inputs should be full sequence length (non-padded)
+            # seq_len=18 minus 2 padding tokens = 16 non-padded tokens
+            expected_len = 10 + 8 - 2
+            assert len(datum.loss_fn_inputs["target_tokens"].data) == expected_len
+            assert len(datum.loss_fn_inputs["logprobs"].data) == expected_len
+            assert len(datum.loss_fn_inputs["advantages"].data) == expected_len
+
+    def test_padding_stripped(self):
+        """Verify that padding tokens are stripped from model_input."""
+        input_ids = torch.tensor([[0, 0, 10, 20, 30, 40, 50, 60]])  # 2 pad + 6 real
+        attention_mask = torch.tensor([[0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]])
+        response_mask = torch.tensor([[1.0, 1.0, 0.0]])
+
+        data = TensorDict(
+            {"input_ids": input_ids, "attention_mask": attention_mask, "response_mask": response_mask},
+            batch_size=[1],
+        )
+
+        datums = tensordict_to_datums(data, for_training=False)
+        tokens = datums[0].model_input.chunks[0].tokens
+        assert tokens == [10, 20, 30, 40, 50, 60]  # padding stripped
+
+
+class TestTensordictToModelInputs:
+    def test_basic(self):
+        data = _make_tensordict(bs=2, prompt_len=5, response_len=3)
+        model_inputs = tensordict_to_model_inputs(data)
+        assert len(model_inputs) == 2
+        for mi in model_inputs:
+            assert isinstance(mi, tinker.ModelInput)

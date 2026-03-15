@@ -59,7 +59,7 @@ class TinkerRollout(BaseRollout):
 
     async def update_weights(
         self,
-        weights: Generator[tuple[str, torch.Tensor], None, None],
+        weights: Generator[tuple[str, torch.Tensor], None, None] = None,
         **kwargs,
     ):
         """

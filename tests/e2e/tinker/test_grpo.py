@@ -145,8 +145,8 @@ def run_grpo(model_name: str, n_steps: int, batch_size: int, lora_rank: int):
             tokens = list(seq.tokens)[:max_response_length]
             response_ids_list.append(tokens)
             completions.append(tokenizer.decode(tokens))
-            if seq.token_log_probs is not None:
-                response_logprobs_list.append(list(seq.token_log_probs)[:max_response_length])
+            if seq.logprobs is not None:
+                response_logprobs_list.append(list(seq.logprobs)[:max_response_length])
             else:
                 response_logprobs_list.append([0.0] * len(tokens))
 
